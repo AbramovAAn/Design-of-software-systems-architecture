@@ -1,6 +1,10 @@
+param(
+    [ValidateRange(1, 65535)]
+    [int]$Port = 8090
+)
+
 $ErrorActionPreference = 'Stop'
 
-$Port = 8080
 $BaseUrl = "http://localhost:$Port/"
 
 $script:state = @{
@@ -152,7 +156,7 @@ function Send-RawHttpResponse {
         "Content-Length: $($BodyBytes.Length)"
         'Access-Control-Allow-Origin: *'
         'Access-Control-Allow-Headers: Content-Type'
-        'Access-Control-Allow-Methods: GET, POST, OPTIONS'
+        'Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS'
         'Connection: close'
         ''
         ''
@@ -247,6 +251,11 @@ function Get-OfferById {
 function Get-OfferByDeviceId {
     param([int]$DeviceId)
     return $script:state.offers | Where-Object { $_.deviceId -eq $DeviceId } | Select-Object -First 1
+}
+
+function Get-DeviceTypeById {
+    param([int]$Id)
+    return $script:state.deviceTypes | Where-Object { $_.id -eq $Id } | Select-Object -First 1
 }
 
 function New-ApiError {
@@ -545,6 +554,65 @@ function Handle-PostTransfers {
     Send-JsonResponse -Context $Context -StatusCode 201 -Body $transfer
 }
 
+function Handle-PutDeviceType {
+    param($Context, [int]$DeviceTypeId)
+
+    $deviceType = Get-DeviceTypeById -Id $DeviceTypeId
+    if ($null -eq $deviceType) {
+        Send-JsonResponse -Context $Context -StatusCode 404 -Body (New-ApiError -Message 'Device type not found.')
+        return
+    }
+
+    $body = Read-JsonBody -Request $Context.Request
+    if ($null -eq $body) {
+        Send-JsonResponse -Context $Context -StatusCode 400 -Body (New-ApiError -Message 'Request body is required.')
+        return
+    }
+
+    if (-not (Test-BodyField -Body $body -Field 'name') -or [string]::IsNullOrWhiteSpace([string]$body.name)) {
+        Send-JsonResponse -Context $Context -StatusCode 400 -Body (New-ApiError -Message "Field 'name' is required.")
+        return
+    }
+
+    $normalizedName = ([string]$body.name).Trim()
+    $duplicate = $script:state.deviceTypes |
+        Where-Object { $_.id -ne $DeviceTypeId -and $_.name -eq $normalizedName } |
+        Select-Object -First 1
+    if ($null -ne $duplicate) {
+        Send-JsonResponse -Context $Context -StatusCode 409 -Body (New-ApiError -Message 'Device type with this name already exists.')
+        return
+    }
+
+    $deviceType.name = $normalizedName
+    $deviceType.updatedAt = [DateTime]::UtcNow.ToString('s') + 'Z'
+
+    Send-JsonResponse -Context $Context -StatusCode 200 -Body $deviceType
+}
+
+function Handle-DeleteDeviceType {
+    param($Context, [int]$DeviceTypeId)
+
+    $deviceType = Get-DeviceTypeById -Id $DeviceTypeId
+    if ($null -eq $deviceType) {
+        Send-JsonResponse -Context $Context -StatusCode 404 -Body (New-ApiError -Message 'Device type not found.')
+        return
+    }
+
+    $linkedDevice = $script:state.devices | Where-Object { $_.deviceTypeId -eq $DeviceTypeId } | Select-Object -First 1
+    if ($null -ne $linkedDevice) {
+        Send-JsonResponse -Context $Context -StatusCode 409 -Body (New-ApiError -Message 'Device type cannot be deleted because it is linked to existing devices.')
+        return
+    }
+
+    $script:state.deviceTypes = @($script:state.deviceTypes | Where-Object { $_.id -ne $DeviceTypeId })
+
+    Send-JsonResponse -Context $Context -StatusCode 200 -Body @{
+        id = $DeviceTypeId
+        status = 'DELETED'
+        deletedAt = [DateTime]::UtcNow.ToString('s') + 'Z'
+    }
+}
+
 function Handle-Request {
     param($Context)
 
@@ -607,6 +675,16 @@ function Handle-Request {
 
     if ($method -eq 'POST' -and $resource.Count -eq 1 -and $resource[0] -eq 'transfers') {
         Handle-PostTransfers -Context $Context
+        return
+    }
+
+    if ($method -eq 'PUT' -and $resource.Count -eq 2 -and $resource[0] -eq 'device-types' -and $resource[1] -match '^\d+$') {
+        Handle-PutDeviceType -Context $Context -DeviceTypeId ([int]$resource[1])
+        return
+    }
+
+    if ($method -eq 'DELETE' -and $resource.Count -eq 2 -and $resource[0] -eq 'device-types' -and $resource[1] -match '^\d+$') {
+        Handle-DeleteDeviceType -Context $Context -DeviceTypeId ([int]$resource[1])
         return
     }
 
